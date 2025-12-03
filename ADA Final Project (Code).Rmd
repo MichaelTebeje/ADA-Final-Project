@@ -1,0 +1,465 @@
+---
+title: "ADA"
+author: "Michael Tebeje"
+date: "2025-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Install packages
+```{r}
+install.packages("srvyr")
+install.packages("mice")
+install.packages("readr")
+install.packages("VIM")
+install.packages("lattice")
+install.packages("ResourceSelection")
+install.packages("pROC")
+```
+#Load packages
+```{r}
+library(tidyverse)
+library(haven)
+library(survey)
+library(srvyr)
+library(mice)
+library(broom)
+library(janitor)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(lattice)
+library(VIM)
+library(car)               
+library(ResourceSelection) 
+library(pROC)
+library(table1)
+library(DiagrammeR)
+```
+#Load data
+```{r}
+mydata <- read_sav("C:/Users/Michael/Desktop/Data/Merged and revised final draft - Copy.sav")
+```
+
+#Defining my study population: People who are 18 years and above,not pregnant, complete HbA1c value, and who reported diabetes as No 
+```{r}
+mydata2 <- mydata %>% filter(
+    RIDAGEYR >= 18,                        # adults
+    is.na(RIDEXPRG) | RIDEXPRG != 1,       # not pregnant
+    !is.na(LBXGH),                         # complete HbA1c
+    DIQ010 == 2                            # diabetes status = NO
+  )
+```
+
+#recode the HgbA1c variable as a binary
+```{r}
+mydata_r <- mydata2 %>%
+  mutate(
+    # Binary outcome
+    hba1c_Bin = if_else(LBXGH >= 6.5, 1L, 0L),
+
+    # BMI categories from BMXBMI
+    bmi_cat = case_when(
+      BMXBMI < 18              ~ "Underweight",
+      BMXBMI >= 18  & BMXBMI < 25 ~ "Normal",
+      BMXBMI >= 25  & BMXBMI < 30 ~ "Overweight",
+      BMXBMI >= 30              ~ "Obese",
+      TRUE                     ~ NA_character_
+    ),
+
+    # Recode education: 7 and 9 -> missing (NA)
+    DMDEDUC2 = ifelse(DMDEDUC2 %in% c(7, 9), NA, DMDEDUC2)
+  )
+```
+#check missingness of the variables i will be using in my analysis
+```{r}
+analysis_vars <- c(
+  "LBXGH",      # HbA1c
+  "hba1c_Bin",  # HbA1c recode
+  "LBXTC",      # total cholesterol
+  "RIDAGEYR",   # age
+  "RIAGENDR",   # sex
+  "RIDRETH3",   # race/ethnicity
+  "DMDEDUC2",   # education
+  "bmi_cat"      # BMI
+)
+
+# optional: sanity check
+analysis_vars[!analysis_vars %in% names(mydata_r)]
+
+n_total <- nrow(mydata_r)
+
+missing_analytic_long <- mydata_r %>%
+  summarise(
+    across(
+      all_of(analysis_vars),
+      ~ sum(is.na(.)),
+      .names = "{.col}_n_missing"
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to  = "variable",
+    values_to = "n_missing"
+  ) %>%
+  mutate(
+    variable    = sub("_n_missing$", "", variable),
+    n_total     = n_total,
+    pct_missing = (n_missing / n_total) * 100
+  )
+
+missing_analytic_long
+```
+
+- From the above we can see that after defining our population we have 4.5% missingess in total cholestrol level, 4.7% missingness in education, and 1.3% missing in BMI varaible.
+
+#Now we define our analytical variables and variables that we will be using for imputation purposes
+```{r}
+analytic_core <- c(
+  "LBXGH",      # HbA1c
+  "hba1c_Bin",  # HbA1c recode
+  "LBXTC",      # total cholesterol
+  "RIDAGEYR",   # age
+  "RIAGENDR",   # sex
+  "RIDRETH3",   # race/ethnicity
+  "DMDEDUC2",   # education
+  "bmi_cat"      # BMI
+)
+
+# Extra variables ONLY for imputation
+aux_vars <- c(
+  "LBDLDLN",    # LDL
+  "INDFMPIR"    # income-to-poverty ratio
+)
+
+# Combine and keep only those that actually exist in data4
+vars_keep <- intersect(c(analytic_core, aux_vars), names(mydata_r))
+
+vars_keep
+```
+
+#create a clean data with only the varaibles that we need
+```{r}
+mydata3 <- mydata_r[, vars_keep] %>%      # keep only analytic variables
+  
+  # rename variables
+  rename(
+    hba1c = LBXGH,
+    chol  = LBXTC,
+    age   = RIDAGEYR,
+    sex   = RIAGENDR,
+    race  = RIDRETH3,
+    educ  = DMDEDUC2,
+    bmi   = bmi_cat,
+    pir   = INDFMPIR,
+    ldl   = LBDLDLN
+  )
+
+names(mydata3)
+```
+
+# Look at missing data patterns
+```{r}
+md.pattern(mydata3, rotate.names=TRUE)
+```
+
+* For our analytic group (excluding the variables we only use for imputation *the last 2 varibles on the right*)
+- There are 212 people who have missing values for education only
+- There are 216 people who have missing values for total cholesterol only
+- There are 51 people who have missing values for bmi only
+- There are 6 people who have missing values for both BMI and cholesterol
+
+* For the total group including the variables we will use for imputation we can see only 1 people having missingness for 5 variables, 3 people having missingness for 4 variables, 68 people having missingness for 3 variables, and 557 people having missingness for 2 variables.
+
+
+
+#compare distribution of missingness of other variables with total cholestrol 
+```{r}
+pbox(mydata3, pos=3) # 3 is the column index (the number of the column from left to right)
+```
+
+- The graph above shows that the distribution of missingness of BMI and education values have a lower median of total cholestrol value than those who are non missing.
+
+
+```{r}
+  ggplot(mydata3, aes(x = factor(hba1c_Bin), y = chol, fill = factor(hba1c_Bin))) +
+  geom_boxplot() +
+  labs(x = "HbA1c (Binary)", y = "Total Cholesterol (mg/dL)") +
+  theme_bw()
+
+```
+
+- The graph shows the median of HbA1c level looks grossly similar but the interquartile range of those who have >6.5(mg/dl) is bigger than those who have <6.5(mg/dl).
+- Those who have <6.5(mg/dl) have also more extreme values around 300 and above than those who have <6.5(mg/dl)
+# Impute
+```{r}
+mydata_imp <- mice(
+  mydata3,
+  m      = 10,
+  maxit  = 5,
+  method = "pmm",
+  seed   = 1000000
+)
+mydata_imp     
+```
+
+
+# Diagnostics for imputation model: Are the imputed values plausible? 
+```{r}
+# See which variables were actually imputed
+names(mydata_imp$imp)
+
+# Check imputations for total cholesterol
+mydata_imp$imp$chol
+
+# Check imputations for BMI
+mydata_imp$imp$bmi
+
+# Check imputations for education
+mydata_imp$imp$educ
+```
+- The imputed variables look plausible with no values being unrealistic.
+
+#exclude the variables we used for imputation and keep the analytical variables
+```{r}
+imp1 <- complete(mydata_imp, 1) %>%      # use imputed dataset #1
+  dplyr::select(hba1c_Bin, chol, age, sex, race, educ, bmi)
+```
+
+
+#Logistic regression on imputed data
+```{r}
+fit_mi <- with(
+  mydata_imp,
+  glm(
+    hba1c_Bin ~ chol + age +
+      factor(sex) + factor(race) + factor(educ) +
+      bmi,
+    family = binomial()
+  )
+)
+
+# Pool estimates across imputations
+pool_fit <- pool(fit_mi)
+
+# Get pooled odds ratios with 95% CI
+or_mi <- tidy(pool_fit, conf.int = TRUE, exponentiate = TRUE)
+or_mi   # look for the 'chol' row
+```
+- From our analysis above we can see that after adjusting for race, age, sex, education, and bmi the odds of having undiagnosed diabetes(Hba1c > 6.5mg/dl) increases by 0.23% with every 1mg/dl increment in total cholestrol level but the association is not significant as the 95% CI crosses the null, AOR=1.002354 (95%CI:0.9978 - 1.007) ; P>0.05. 
+
+#Create 1 completed dataset to check diagnostic/assumptions and fit to the current model
+```{r}
+imp1 <- complete(mydata_imp, 1) %>%
+  dplyr::select(hba1c_Bin, chol, age, sex, race, educ, bmi)
+
+fit_imp1 <- glm(
+  hba1c_Bin ~ chol + age +
+    factor(sex) + factor(race) + factor(educ) +
+    bmi,
+  data   = imp1,
+  family = binomial()
+)
+
+summary(fit_imp1)
+```
+
+#check for assumptions
+```{r}
+y_model <- fit_imp1$y          # outcome actually used in the model
+p_model <- fitted(fit_imp1)    # predicted probs for those same rows
+
+length(y_model)
+length(p_model)                # these will match
+# check multicolinearity
+vif(fit_imp1)  
+
+#Check goodness of fit
+hoslem.test(fit_imp1$y, fitted(fit_imp1), g = 10)
+#ROC curve & AUC
+roc_imp1 <- roc(y_model, p_model)
+auc(roc_imp1)
+plot(roc_imp1)
+
+#check influential observation
+cooks_imp1 <- cooks.distance(fit_imp1)
+
+# look at the largest 10
+sort(cooks_imp1, decreasing = TRUE)[1:10]
+
+# plot with rule-of-thumb cutoff
+plot(cooks_imp1, type = "h")
+abline(h = 4 / nrow(imp1), lty = 2, col = "red")
+```
+-When we examined the model diagnostics, the assumption of multicollinearity was met, as all VIF values were below 5. Influence diagnostics showed no extreme observations, with all Cook’s distance values below 1. However, the Hosmer–Lemeshow goodness-of-fit test was statistically significant, indicating that the model does not adequately fit the data but in a large data file Hosmer-Lemeshow often get too sensetive so after looking at the other diagnostic tests and confirming they are all good i continued with the model.
+#check effect modification by total cholestrol X sex
+```{r}
+fit_int_sex <- with(
+  mydata_imp,
+  glm(
+    hba1c_Bin ~ chol * factor(sex) +
+      age +
+      factor(race) +
+      factor(educ) +
+      bmi,
+    family = binomial()
+  )
+)
+
+pool_int_sex <- pool(fit_int_sex)
+
+or_int_sex <- tidy(pool_int_sex, conf.int = TRUE, exponentiate = TRUE)
+or_int_sex
+
+#pull interaction term
+or_int_sex[grepl("chol:factor\\(sex\\)", or_int_sex$term), ]
+```
+- The effect modification test with interaction of cholestrol level with sex was not significant with P>0.05.
+
+#check effect modification by total cholestrol X race
+```{r}
+# Effect modification by race
+fit_int_race <- with(
+  mydata_imp,
+  glm(
+    hba1c_Bin ~ chol * factor(race) +
+      age +
+      factor(sex) +
+      factor(educ) +
+      bmi,
+    family = binomial()
+  )
+)
+
+pool_int_race <- pool(fit_int_race)
+
+or_int_race <- tidy(pool_int_race, conf.int = TRUE, exponentiate = TRUE)
+or_int_race
+
+#pull the interaction with race
+or_int_race[grepl("chol:factor\\(race\\)", or_int_race$term), ]
+```
+- The effect modification test with interaction of cholestrol and race is also insignificant with P>0.05
+##Now we develop the completed case analysis for sensetivity analysis
+```{r}
+cc_data <- mydata3 %>%
+  dplyr::select(hba1c_Bin, chol, age, sex, race, educ, bmi) %>%  # analytic vars only
+  filter(complete.cases(.))                                      # drop any missing
+nrow(mydata3)
+nrow(cc_data) 
+
+```
+
+#Logistic regression on completed case
+```{r}
+fit_cc <- glm(
+  hba1c_Bin ~ chol + age +
+    factor(sex) + factor(race) + factor(educ) +
+    bmi,
+  data   = cc_data,
+  family = binomial()
+)
+
+summary(fit_cc)
+
+# ORs with 95% CI
+or_cc <- tidy(fit_cc, conf.int = TRUE, exponentiate = TRUE)
+or_cc
+
+# Cholesterol row only (to compare with MI result)
+or_cc_chol <- or_cc[or_cc$term == "chol", ]
+or_cc_chol
+```
+- The complete case analysis is also not significant with P>0.05.
+
+#Interaction with sex on completed case
+```{r}
+fit_cc_int_sex <- glm(
+  hba1c_Bin ~ chol * factor(sex) +
+    age + factor(race) + factor(educ) + bmi,
+  data   = cc_data,
+  family = binomial()
+)
+
+or_cc_int_sex <- tidy(fit_cc_int_sex, conf.int = TRUE, exponentiate = TRUE)
+or_cc_int_sex[grepl("chol:factor\\(sex\\)", or_cc_int_sex$term), ]
+```
+-The complete case analysis of the effect modification with cholesterol X sex is also not significant with an AOR=0.0047,(95%CI:0.9847-1.0032); P>0.05
+#Interaction with race on completed case
+```{r}
+fit_cc_int_race <- glm(
+  hba1c_Bin ~ chol * factor(race) +
+    age + factor(sex) + factor(educ) + bmi,
+  data   = cc_data,
+  family = binomial()
+)
+
+or_cc_int_race <- tidy(fit_cc_int_race, conf.int = TRUE, exponentiate = TRUE)
+or_cc_int_race[grepl("chol:factor\\(race\\)", or_cc_int_race$term), ]
+```
+
+-The complete case analysis of the effect modification with cholesterol X race is also not significant with P>0.05.
+
+#descriptive table
+```{r}
+# Work on a copy just for descriptives
+desc_data <- mydata3
+
+# Recodes for readability 
+desc_data <- desc_data %>%
+  mutate(
+    sex  = factor(sex,  labels = c("Male", "Female")),
+    race = factor(race, labels = c(
+      "Mexican American",
+      "Other Hispanic",
+      "Non-Hispanic White",
+      "Non-Hispanic Black",
+      "Non-Hispanic Asian",
+      "Other/Multiracial"
+    )),
+    educ = factor(educ, labels = c(
+      "< 9th grade",
+      "9–11th grade",
+      "High school/GED",
+      "Some college/AA",
+      "College graduate or above"
+    ))
+  )
+
+# (optional) variable labels for the table
+label(desc_data$chol)       <- "Total cholesterol (mg/dL)"
+label(desc_data$age)        <- "Age (years)"
+label(desc_data$bmi)        <- "BMI (kg/m²)"
+label(desc_data$sex)        <- "Sex"
+label(desc_data$race)       <- "Race/ethnicity"
+label(desc_data$educ)       <- "Education"
+label(desc_data$hba1c_Bin)  <- "Undiagnosed diabetes (HbA1c ≥6.5%)"
+
+table1(
+  ~ chol + age + bmi + sex + race + educ |
+    hba1c_Bin,
+  data = desc_data,
+  overall = "Total"
+)
+```
+- Participants with elevated HbA1c level are older and have higher overweight and obesity people compared with those with normal HbA1c. Racial and ethnic patterns also differed, with a greater proportion of non-Hispanic Black and Mexican American individuals in the elevated HbA1c group. Education levels tended to be lower among those with elevated HbA1c, while total cholesterol levels were similar across groups. There are some missing values in total cholesterol, race, and education variables.
+#Flowchart
+```{r}
+grViz("
+digraph flowchart {
+
+  graph [layout = dot, rankdir = TB]
+
+  node [fontname = Helvetica, shape = rectangle, fontsize = 15]
+
+  node1 [label = 'NHANES 2021-2023 participants with merged exam & lab data\\nN = 8,587']
+  node2 [label = 'Excluded: age < 18 years, pregnant, incomplete data on HbA1c, and self-reported diabetes\\nN excluded = 3,658; remaining N = 4,929']
+
+  node1 -> node2;
+}
+")
+```
+
