@@ -155,5 +155,6 @@ Uses `DiagrammeR::grViz()` to draw a simple flowchart:
   
 ## Author  
  Name: Michael Tebeje  
- Course: Advanced Data Analysis (ADA)
+ Course: Advanced Data Analysis (ADA) 
  Date: December 01, 2025
+
